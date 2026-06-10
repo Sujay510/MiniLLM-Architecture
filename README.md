@@ -1,111 +1,115 @@
 # MiniLLM Architecture
 
-Building a language model from scratch using PyTorch. No shortcuts, no copying just building each piece one step at a time to actually understand how it works.
+A Transformer-based language model built from scratch in PyTorch  no HuggingFace, no high-level LLM abstractions. Every component is implemented manually to understand what actually happens inside a language model.
 
-# Why
+---
 
-I wanted to understand what actually happens inside an LLM, not just use one. So I started from the most basic thing a single weight that learns and kept adding one concept at a time until I had something that looks like a real Transformer.
+## What This Is
 
-# The Steps
+This project builds a working LLM pipeline across incremental steps, starting from raw gradient descent and ending at a model that tokenizes text, trains on next-token prediction, and autoregressively generates output.
 
-### step1.py Single weight, gradient descent
+The goal was not to train a useful model  it was to understand the mechanics of every component by implementing them from first principles.
 
-One input, one weight, one target. The gradient descent loop is written by hand.
+---
 
-```python
-x = torch.tensor(2.0)
-w = torch.tensor(1.5, requires_grad=True)
-# w learns to make w*x = 4.0
-```
+---
 
-### step2.py   Multiple inputs, dot product
+## Components (by file)
 
-Extended to a vector of inputs. Uses `torch.dot` to compute a weighted sum   basically one neuron.
+### `tokenizer.py` : Word-level tokenizer
+Splits text on whitespace, builds a sorted vocabulary, maps words to integer IDs and back. No OOV handling — toy use only.
 
-### step3.py   Weight matrix, multiple outputs
+### `simplenetwork.py` : Baseline feedforward network
+A 2-layer MLP with ReLU trained via SGD to verify the gradient descent loop before adding any Transformer complexity.
 
-Now `W` is a 2x3 matrix. Two neurons reading the same three inputs, producing two separate outputs. First time using matrix multiplication.
+### `selfattention.py` : Self-attention module
+Implements Q/K/V projections, scaled dot-product attention (`scores / √embed_dim`), and LayerNorm with residual connection.
 
-```python
-y = w @ x + b
-```
+The scaling by `√embed_dim` prevents softmax saturation: without it, large dot products push the softmax toward a one-hot distribution, causing vanishing gradients and stalled training.
 
-### step4.py   Two layers stacked
+### `llm.py` : Full TinyLLM
 
-Two linear layers, both learning at the same time. The output of layer 1 feeds into layer 2. First real multi-layer network.
+Combines all components into a working model:
 
-### step5.py   ReLU activation
-
-Added `F.relu()` after the first layer. Without an activation, stacking linear layers is still just one linear layer mathematically. This is what makes it actually deeper.
-
-### step6.py   nn.Module
-
-Rewrote everything as a proper PyTorch class. Replaced manual gradient zeroing with `torch.optim.SGD`. This is the standard pattern all real models use.
+**Causal mask** : prevents each token from attending to future positions. Implemented as an upper-triangular mask filled with `-inf` before softmax, so future positions contribute exactly zero attention weight (`e^-inf = 0`).
 
 ```python
-class SimpleNetwork(nn.Module):
-    def __init__(self):
-        self.layer1 = nn.Linear(3, 2)
-        self.layer2 = nn.Linear(2, 1)
+mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+scores = scores.masked_fill(mask, float('-inf'))
 ```
 
-### step7.py   Token Embeddings
-
-Shifted to language. `nn.Embedding` maps integer token IDs to float vectors. This is how LLMs represent words.
+**Positional embeddings** : learned embeddings added to token embeddings so the model can distinguish token order. Addition (not concatenation) keeps the hidden dimension constant across all downstream layers.
 
 ```python
-embedding = nn.Embedding(10, 4)  # 10 words, each as a 4D vector
+h = self.token_emb(x) + self.pos_emb(positions)
 ```
 
-### step8.py   Self-attention from scratch
+**Feed-forward network** : inner dimension is 4× the embedding dimension, following the original Transformer paper. Applied per-token after attention.
 
-Implemented attention by hand without any module wrapper. Q, K, V matrices computed manually, scores via `Q @ K.T`, softmax, then weighted sum with V.
+**Training** : next-token prediction with cross-entropy loss. Input is `ids[:-1]`, target is `ids[1:]`.
 
-```python
-scores = Q @ K.T
-weights = F.softmax(scores, dim=-1)
-output = weights @ V
-```
+**Generation** : autoregressive: feed the current sequence, take the last token's logits, argmax to get the next token, append and repeat.
 
-### step9.py   Self-attention as nn.Module + LayerNorm
+---
 
-Wrapped the attention logic into a class. Added residual connection and LayerNorm   both from the original Transformer paper.
-
-### LLM.py   Putting it all together
-
-Combined embeddings + stacked attention blocks + feedforward sublayer + final linear projection into `TinyLLM`. Feed it token IDs, get back logits over the vocabulary.
-
-```python
-x = torch.tensor([1, 3, 7])  # 3 token ids
-output = model(x)
-print(output.shape)  # (3, 1000)
-```
-
-### tokenizer.py + LLM+tokenizer.py
-
-Built a tokenizer to convert raw text to token IDs and back, then connected it to the model. This completes the full text-in to logits-out pipeline.
-
-### FINAL.py
-
-Everything in one clean file.
-
-# What's missing
-
-The model has random weights   it hasn't been trained on any real data yet. It also doesn't have causal masking (tokens shouldn't see future tokens during generation) or a proper text generation loop. Those are the next steps.
-
-# Requirements
+## Training Results
 
 ```
-Python 3.x
-PyTorch
+Corpus     : "hello i am sujay you are"
+Vocab size : 6
+embed_dim  : 8
+num_blocks : 2
+Optimizer  : Adam, lr=0.01
 ```
 
-# How to run
+| Iteration | Loss   |
+|-----------|--------|
+| 0         | 2.0809 |
+| 100       | 0.0091 |
+| 500       | 0.0006 |
+| 1000      | 0.0002 |
 
-Each step is standalone, just run:
+The model memorizes the 6-word corpus, which is expected  the point was to verify the pipeline works end-to-end, not to generalize.
+
+```
+Generated: "hello i am sujay you are"
+```
+
+---
+
+## Key Concepts Implemented from Scratch
+
+| Concept | Where |
+|---|---|
+| Gradient descent + backprop | `simplenetwork.py` |
+| Word-level tokenization | `tokenizer.py` |
+| Q/K/V attention + scaling | `selfattention.py`, `llm.py` |
+| Causal masking | `llm.py` |
+| Residual connections | `llm.py` |
+| LayerNorm | `llm.py` |
+| Positional embeddings | `llm.py` |
+| Next-token prediction training | `llm.py` |
+| Autoregressive generation | `llm.py` |
+
+---
+
+## Known Limitations
+
+- Word-level tokenizer with no OOV handling, words outside the training vocabulary will crash encode
+- No multi-head attention, single head only
+- FFN is inside the SelfAttention class rather than a separate TransformerBlock, architecturally merged for simplicity
+- Trained on a 6-word corpus, the model memorizes rather than generalizes
+- Generation uses argmax (greedy), deterministic, no temperature sampling
+
+---
+
+## Requirements
+
+```
+torch
+```
 
 ```bash
-python step1.py
+pip install torch
+python llm.py
 ```
-
-No datasets or pretrained weights needed   everything uses random or hardcoded tensors.
