@@ -2,6 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def top_k_sample(logits: torch.Tensor, k: int, temperature: float = 1.0) -> int:
+    if temperature <= 0: raise ValueError
+    if logits.dim() != 1: raise ValueError
+    if k < 0: raise ValueError
+    x, indices = torch.sort(logits, descending=True)
+    k = min(logits.size(0), k)
+    y = x[:k] / temperature
+    result = torch.softmax(y, dim=0)
+    sample = torch.multinomial(result, num_samples=1)
+    return indices[sample].item()
 class Simple_Tokenizer:
     def __init__(self,text):
         words = text.split()
@@ -39,10 +49,11 @@ class SelfAttention(nn.Module):
         scores = scores.masked_fill(mask, float('-inf'))
         weights = F.softmax(scores, dim =-1)
         output = weights @ V
-        ff_output = self.ff(output)
-        return self.norm(ff_output + output)
+        x = self.norm(output + x)
+        ff_output = self.ff(x)
+        return self.norm(ff_output + x)
 class TinyLLM(nn.Module):
-    def __init__(self, embed_dim, num_blocks):
+    def __init__(self,vocab_size, embed_dim, num_blocks):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size,embed_dim)
         self.pos_embedding = nn.Embedding(100, embed_dim)
@@ -59,11 +70,11 @@ class TinyLLM(nn.Module):
             x = block(x)
         return self.final_linear(x)
     
-text = "the cat sat on the mat"
+text = "hello i am sujay you are"
 tokenizer = Simple_Tokenizer(text)
 
 # encode input
-ids = tokenizer.encode("the cat sat")
+ids = tokenizer.encode(text)
 x = torch.tensor(ids)
 
 # pass through model
@@ -71,11 +82,11 @@ vocab_size = len(tokenizer.word_to_id)
 embed_dim = 8
 num_blocks = 2
 
-model = TinyLLM(embed_dim, num_blocks)
+model = TinyLLM(vocab_size,embed_dim,num_blocks)
 output = model(x)
 print(output.shape)
 
-ids = tokenizer.encode("the cat sat on the mat")
+ids = tokenizer.encode(text)
 input_ids  = torch.tensor(ids[:-1])   # [4, 0, 3, 2, 5]
 target_ids = torch.tensor(ids[1:])    # [0, 3, 2, 5, 1]
 
@@ -105,10 +116,10 @@ def generate(model, tokenizer, start_word, num_words=5):
         
         # get last token's prediction
         last_scores = output[-1]
-        next_id = torch.argmax(last_scores).item()
+        next_id = top_k_sample(last_scores, k=3, temperature=0.8)
         next_word = tokenizer.id_to_word[next_id]
         words.append(next_word)
     
     return " ".join(words)
 
-print(generate(model, tokenizer, "the"))
+print(generate(model, tokenizer, "hello"))
