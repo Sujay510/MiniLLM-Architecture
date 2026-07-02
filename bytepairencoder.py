@@ -10,7 +10,7 @@ def initial_vocab(text):
     vocab = {}
     words = text.split()
     for word in words:
-        spaced = " ".join(list(word))
+        spaced = " ".join(list(word)) + " _"
         vocab[spaced] = vocab.get(spaced, 0) + 1
     return vocab
 
@@ -37,7 +37,7 @@ def encode(text,merges):
     words = text.split()
     tokens = [] 
     for word in words: 
-        spaced = " ".join(str(word))
+        spaced = " ".join(str(word)) + " _"
         for pair in merges:
             find = " ".join(pair)
             replace = "".join(pair)
@@ -45,10 +45,14 @@ def encode(text,merges):
         tokens.extend(spaced.split())
     return tokens
 
+def decode(tokens):
+    text = "".join(tokens)
+    text = text.replace("_"," ")
+    return text.strip()
 
 merges = train_bpe("hello world hello", num_merges=5)
 print(merges)
 
 tokens = encode("hello world hello", merges)
 print(tokens)
-            
+print(decode(tokens))
