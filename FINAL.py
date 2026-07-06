@@ -1,6 +1,22 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import bytepairencoder as bpe
+import os
+
+def batch(ids,size,batch_size):
+    input_list = []
+    target_list = []
+    for _ in range(batch_size):
+        start = torch.randint(0, len(ids) - size, (1,)).item()
+        chunk = ids[start:start+size+1]
+        input_ids1 = torch.tensor(chunk[:-1])
+        target_ids1 = torch.tensor(chunk[1:])
+        input_list.append(input_ids1)
+        target_list.append(target_ids1)
+    input_ids = torch.stack(input_list) 
+    target_ids = torch.stack(target_list) 
+    return input_ids, target_ids
 
 def top_k_sample(logits: torch.Tensor, k: int, temperature: float = 1.0) -> int:
     if temperature <= 0: raise ValueError
@@ -12,18 +28,20 @@ def top_k_sample(logits: torch.Tensor, k: int, temperature: float = 1.0) -> int:
     result = torch.softmax(y, dim=0)
     sample = torch.multinomial(result, num_samples=1)
     return indices[sample].item()
+
 class Simple_Tokenizer:
-    def __init__(self,text):
-        words = text.split()
-        vocab = sorted(list(set(words)))
+    def __init__(self,tokens,merges):
+        self.merges = merges
+        vocab = sorted(list(set(tokens)))
         self.word_to_id = {word: i for i, word in enumerate(vocab)}
         self.id_to_word = {i: word for i, word in enumerate(vocab)}
 
     def encode(self,text):
-        words = text.split()
-        return [self.word_to_id[word] for word in words]
+        tokens = bpe.encode(text,self.merges)
+        return [self.word_to_id[token] for token in tokens]
     def decode(self,ids):
-        return [self.id_to_word[id] for id in ids]
+        tokens = [self.id_to_word[id] for id in ids]
+        return bpe.decode(tokens)
     
 class SelfAttention(nn.Module):
     def __init__(self, embed_dim):
@@ -40,7 +58,7 @@ class SelfAttention(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        seq_len = x.shape[0]
+        seq_len = x.shape[1]
         Q = self.Wq(x)
         K = self.Wk(x)
         V = self.Wv(x)
@@ -52,6 +70,41 @@ class SelfAttention(nn.Module):
         x = self.norm(output + x)
         ff_output = self.ff(x)
         return self.norm(ff_output + x)
+    
+class MultiHeadAttention(nn.Module):
+    def __init__(self,embed_dim,num_heads):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.Wq = nn.Linear(embed_dim, embed_dim)
+        self.Wk = nn.Linear(embed_dim, embed_dim)
+        self.Wv = nn.Linear(embed_dim, embed_dim)
+        self.Wo = nn.Linear(embed_dim, embed_dim)
+    
+    def forward(self,x):
+        batch_size = x.shape[0]
+        seq_len = x.shape[1]
+
+        Q = self.Wq(x)
+        K = self.Wk(x)
+        V = self.Wv(x)
+
+        Q = Q.view(batch_size,seq_len,self.num_heads,self.head_dim)
+        K = K.view(batch_size,seq_len,self.num_heads,self.head_dim)
+        V = V.view(batch_size,seq_len,self.num_heads,self.head_dim)
+        Q = Q.transpose(1,2)
+        K = K.transpose(1,2)
+        V = V.transpose(1,2)
+
+        scores = Q@K.transpose(-2,-1)/((self.head_dim)**0.5)
+        mask = torch.triu(torch.ones(seq_len,seq_len),diagonal=1).bool()
+        scores = scores.masked_fill(mask,float('-inf'))
+        weights = F.softmax(scores,dim=-1)
+        output = weights@V
+        output = output.reshape(batch_size,seq_len,self.embed_dim)
+        output = self.Wo(output)
+        return output
 class TinyLLM(nn.Module):
     def __init__(self,vocab_size, embed_dim, num_blocks):
         super().__init__()
@@ -64,62 +117,73 @@ class TinyLLM(nn.Module):
         
 
     def forward(self, x):
-        positions = torch.arange(len(x))   # [0, 1, 2, 3, 4]
+        positions = torch.arange(x.shape[1])  
         x = self.embedding(x) + self.pos_embedding(positions)
         for block in self.blocks:
             x = block(x)
         return self.final_linear(x)
-    
-text = "hello i am sujay you are"
-tokenizer = Simple_Tokenizer(text)
+
+with open("shakespeare.txt") as f:  
+    text = f.read()
+merges = bpe.train_bpe(text,num_merges=300)
+tokens = bpe.encode(text,merges)
+tokenizer = Simple_Tokenizer(tokens,merges)
 
 # encode input
-ids = tokenizer.encode(text)
-x = torch.tensor(ids)
+ids = [tokenizer.word_to_id[t] for t in tokens]
 
 # pass through model
 vocab_size = len(tokenizer.word_to_id)
-embed_dim = 8
-num_blocks = 2
+embed_dim = 64
+num_blocks = 4
 
 model = TinyLLM(vocab_size,embed_dim,num_blocks)
-output = model(x)
+input_ids,target_ids = batch(ids,size=32,batch_size=16)
+output = model(input_ids)
 print(output.shape)
 
-ids = tokenizer.encode(text)
-input_ids  = torch.tensor(ids[:-1])   # [4, 0, 3, 2, 5]
-target_ids = torch.tensor(ids[1:])    # [0, 3, 2, 5, 1]
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+if os.path.exists("model.pt"):
+    model.load_state_dict(torch.load("model.pt"))
+    optimizer.load_state_dict(torch.load("optimizer.pt"))
+    print("Checkpoint Loaded")
+else:
+    print("Fresh Start")
 
 for i in range(1000):
-    output = model(input_ids)         # (5, vocab_size)
+    input_ids,target_ids = batch(ids,size=32,batch_size=16)
+    output = model(input_ids)
+    output = output.reshape(-1,vocab_size)
+    target_ids = target_ids.reshape(-1)
     loss = F.cross_entropy(output, target_ids)
     
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    if i % 100 == 0:
-        print(f"Iter {i}: output = {output.detach()}loss={loss.item():.4f}")
+    if i % 1000 == 0:
+        print(f"Iter {i}: loss={loss.item():.4f}")
 
-def generate(model, tokenizer, start_word, num_words=5):
+torch.save(model.state_dict(),"model.pt")
+torch.save(optimizer.state_dict(),"optimizer.pt")
+
+def generate(model, tokenizer, start_word, num_words=30):
     model.eval()
-    words = [start_word]
+    ids = tokenizer.encode(start_word)
     
     for _ in range(num_words):
-        ids = tokenizer.encode(" ".join(words))
-        x = torch.tensor(ids)
+        x = torch.tensor(ids).unsqueeze(0)
         
         with torch.no_grad():
             output = model(x)
         
         # get last token's prediction
-        last_scores = output[-1]
-        next_id = top_k_sample(last_scores, k=3, temperature=0.8)
-        next_word = tokenizer.id_to_word[next_id]
-        words.append(next_word)
+        last_scores = output[0,-1]
+        next_id = top_k_sample(last_scores, k=2, temperature=0.8)
+        ids.append(next_id)
     
-    return " ".join(words)
+    return tokenizer.decode(ids)
 
-print(generate(model, tokenizer, "hello"))
+print(generate(model, tokenizer, "yolk"))
+

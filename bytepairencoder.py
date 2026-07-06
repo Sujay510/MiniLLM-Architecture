@@ -16,10 +16,23 @@ def initial_vocab(text):
 
 def merge(vocab,pair):
     new = {}
-    find = " ".join(pair)
-    replace = "".join(pair)
     for word,freq in vocab.items():
-        new_word = word.replace(find,replace)
+        symbols = word.split()
+        new_symbols = []
+        i = 0
+        while i<len(symbols):
+            if(i+1<len(symbols)):    
+                if(symbols[i] == pair[0] and symbols[i+1]==pair[1]):
+                    s = symbols[i]+symbols[i+1]
+                    new_symbols.append(s)
+                    i += 2
+                else:
+                    new_symbols.append(symbols[i])
+                    i += 1
+            else: 
+                new_symbols.append(symbols[i])
+                i += 1
+        new_word = " ".join(new_symbols)
         new[new_word] = freq
     return new
 
@@ -38,10 +51,12 @@ def encode(text,merges):
     tokens = [] 
     for word in words: 
         spaced = " ".join(str(word)) + " _"
+        vocab = {}
         for pair in merges:
-            find = " ".join(pair)
-            replace = "".join(pair)
-            spaced = spaced.replace(find,replace)
+            vocab[spaced] = 1
+            vocab = merge(vocab,pair)
+            new_space = list(vocab.keys())
+            spaced = "".join(new_space)
         tokens.extend(spaced.split())
     return tokens
 
@@ -49,10 +64,10 @@ def decode(tokens):
     text = "".join(tokens)
     text = text.replace("_"," ")
     return text.strip()
+if __name__ == "__main__":
+    merges = train_bpe("hello world hello", num_merges=5)
+    print(merges)
 
-merges = train_bpe("hello world hello", num_merges=5)
-print(merges)
-
-tokens = encode("hello world hello", merges)
-print(tokens)
-print(decode(tokens))
+    tokens = encode("hello world hello", merges)
+    print(tokens)
+    print(decode(tokens))
