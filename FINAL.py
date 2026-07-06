@@ -71,6 +71,24 @@ class SelfAttention(nn.Module):
         ff_output = self.ff(x)
         return self.norm(ff_output + x)
     
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim,num_heads):
+        super().__init__()
+        self.attention = MultiHeadAttention(embed_dim,num_heads)
+        self.ff = nn.Sequential(
+                    nn.Linear(embed_dim, 4 * embed_dim),
+                    nn.ReLU(),
+                    nn.Linear(4 * embed_dim, embed_dim)
+                    )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        output = self.attention(x)
+        x = self.norm1(output + x)
+        ff_output = self.ff(x)
+        return self.norm2(ff_output + x)
+    
 class MultiHeadAttention(nn.Module):
     def __init__(self,embed_dim,num_heads):
         super().__init__()
@@ -106,12 +124,12 @@ class MultiHeadAttention(nn.Module):
         output = self.Wo(output)
         return output
 class TinyLLM(nn.Module):
-    def __init__(self,vocab_size, embed_dim, num_blocks):
+    def __init__(self,vocab_size, embed_dim, num_blocks,num_heads):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size,embed_dim)
         self.pos_embedding = nn.Embedding(100, embed_dim)
         self.blocks = nn.ModuleList(
-            [SelfAttention(embed_dim) for _ in range(num_blocks)]
+            [TransformerBlock(embed_dim,num_heads) for _ in range(num_blocks)]
         )
         self.final_linear = nn.Linear(embed_dim, vocab_size)
         
@@ -125,20 +143,22 @@ class TinyLLM(nn.Module):
 
 with open("shakespeare.txt") as f:  
     text = f.read()
-merges = bpe.train_bpe(text,num_merges=300)
+merges = bpe.train_bpe(text,num_merges=700)
 tokens = bpe.encode(text,merges)
 tokenizer = Simple_Tokenizer(tokens,merges)
 
 # encode input
 ids = [tokenizer.word_to_id[t] for t in tokens]
-
+split_pt = int(0.9*len(ids))
+train_ids = ids[:split_pt]
+val_ids = ids[split_pt:]
 # pass through model
 vocab_size = len(tokenizer.word_to_id)
 embed_dim = 64
 num_blocks = 4
 
-model = TinyLLM(vocab_size,embed_dim,num_blocks)
-input_ids,target_ids = batch(ids,size=32,batch_size=16)
+model = TinyLLM(vocab_size,embed_dim,num_blocks,num_heads=8)
+input_ids,target_ids = batch(train_ids,size=32,batch_size=16)
 output = model(input_ids)
 print(output.shape)
 
@@ -152,7 +172,7 @@ else:
     print("Fresh Start")
 
 for i in range(1000):
-    input_ids,target_ids = batch(ids,size=32,batch_size=16)
+    input_ids,target_ids = batch(train_ids,size=32,batch_size=16)
     output = model(input_ids)
     output = output.reshape(-1,vocab_size)
     target_ids = target_ids.reshape(-1)
@@ -162,28 +182,36 @@ for i in range(1000):
     loss.backward()
     optimizer.step()
 
-    if i % 1000 == 0:
-        print(f"Iter {i}: loss={loss.item():.4f}")
+    if i % 100 == 0:
+        val_input,val_target = batch(val_ids,size=32,batch_size=16)
+        with torch.no_grad():
+            val_output = model(val_input)
+            val_output = val_output.reshape(-1,vocab_size)
+            val_target = val_target.reshape(-1)
+            val_loss = F.cross_entropy(val_output,val_target)
+        print(f"Iter {i}: train_loss={loss.item():.4f}, val_loss={val_loss.item():.4f}")
 
 torch.save(model.state_dict(),"model.pt")
 torch.save(optimizer.state_dict(),"optimizer.pt")
 
-def generate(model, tokenizer, start_word, num_words=30):
+def generate(model, tokenizer, start_word, num_words=50,block_size=32):
     model.eval()
     ids = tokenizer.encode(start_word)
     
     for _ in range(num_words):
-        x = torch.tensor(ids).unsqueeze(0)
+        context = ids[-block_size:]
+        x = torch.tensor(context).unsqueeze(0)
         
         with torch.no_grad():
             output = model(x)
         
         # get last token's prediction
         last_scores = output[0,-1]
-        next_id = top_k_sample(last_scores, k=2, temperature=0.8)
+        next_id = top_k_sample(last_scores, k=3, temperature=0.7)
+        print(next_id, tokenizer.id_to_word[next_id])
         ids.append(next_id)
     
     return tokenizer.decode(ids)
-
-print(generate(model, tokenizer, "yolk"))
+seed_text = "Hello, Who are you?"
+print(generate(model, tokenizer, seed_text,num_words=50,block_size=32))
 
