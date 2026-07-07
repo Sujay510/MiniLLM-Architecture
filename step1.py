@@ -15,3 +15,5 @@ for i in range(100):
         w.grad.zero_()
     if i % 10 == 0:
         print(f"Iteration {i}: w={w.item():.4f}, loss={loss.item():.4f}")
+print(torch.cuda.is_available())
+print(torch.backends.mps.is_available())

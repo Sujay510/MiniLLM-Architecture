@@ -3,7 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bytepairencoder as bpe
 import os
+import math
 
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 def batch(ids,size,batch_size):
     input_list = []
     target_list = []
@@ -14,8 +16,8 @@ def batch(ids,size,batch_size):
         target_ids1 = torch.tensor(chunk[1:])
         input_list.append(input_ids1)
         target_list.append(target_ids1)
-    input_ids = torch.stack(input_list) 
-    target_ids = torch.stack(target_list) 
+    input_ids = torch.stack(input_list).to(device)
+    target_ids = torch.stack(target_list).to(device)
     return input_ids, target_ids
 
 def top_k_sample(logits: torch.Tensor, k: int, temperature: float = 1.0) -> int:
@@ -28,6 +30,12 @@ def top_k_sample(logits: torch.Tensor, k: int, temperature: float = 1.0) -> int:
     result = torch.softmax(y, dim=0)
     sample = torch.multinomial(result, num_samples=1)
     return indices[sample].item()
+
+def getlr(current,warmup,total,max_lr,min_lr):
+    if current < warmup:
+        return max_lr*(current/warmup)
+    progress = (current-warmup)/(total - warmup)
+    return min_lr + 0.5*(max_lr-min_lr)*(1+math.cos(math.pi*progress))
 
 class Simple_Tokenizer:
     def __init__(self,tokens,merges):
@@ -63,7 +71,7 @@ class SelfAttention(nn.Module):
         K = self.Wk(x)
         V = self.Wv(x)
         scores = Q@ K.transpose(-2,-1) / ((self.embed_dim)**0.5)
-        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(x.device)
         scores = scores.masked_fill(mask, float('-inf'))
         weights = F.softmax(scores, dim =-1)
         output = weights @ V
@@ -72,7 +80,7 @@ class SelfAttention(nn.Module):
         return self.norm(ff_output + x)
     
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim,num_heads):
+    def __init__(self, embed_dim,num_heads,dropout=0.1):
         super().__init__()
         self.attention = MultiHeadAttention(embed_dim,num_heads)
         self.ff = nn.Sequential(
@@ -82,15 +90,17 @@ class TransformerBlock(nn.Module):
                     )
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        output = self.attention(x)
-        x = self.norm1(output + x)
-        ff_output = self.ff(x)
-        return self.norm2(ff_output + x)
+        output = self.attention(self.norm1(x))
+        x = self.dropout(output) + x
+        ff_output = self.ff(self.norm2(x))
+        x = self.dropout(ff_output) + x
+        return x
     
 class MultiHeadAttention(nn.Module):
-    def __init__(self,embed_dim,num_heads):
+    def __init__(self,embed_dim,num_heads,dropout=0.1):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -99,6 +109,7 @@ class MultiHeadAttention(nn.Module):
         self.Wk = nn.Linear(embed_dim, embed_dim)
         self.Wv = nn.Linear(embed_dim, embed_dim)
         self.Wo = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self,x):
         batch_size = x.shape[0]
@@ -116,26 +127,27 @@ class MultiHeadAttention(nn.Module):
         V = V.transpose(1,2)
 
         scores = Q@K.transpose(-2,-1)/((self.head_dim)**0.5)
-        mask = torch.triu(torch.ones(seq_len,seq_len),diagonal=1).bool()
+        mask = torch.triu(torch.ones(seq_len,seq_len),diagonal=1).bool().to(x.device)
         scores = scores.masked_fill(mask,float('-inf'))
         weights = F.softmax(scores,dim=-1)
         output = weights@V
         output = output.reshape(batch_size,seq_len,self.embed_dim)
         output = self.Wo(output)
+        output = self.dropout(output)
         return output
 class TinyLLM(nn.Module):
-    def __init__(self,vocab_size, embed_dim, num_blocks,num_heads):
+    def __init__(self,vocab_size, embed_dim, num_blocks,num_heads,dropout=0.1):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size,embed_dim)
         self.pos_embedding = nn.Embedding(100, embed_dim)
         self.blocks = nn.ModuleList(
-            [TransformerBlock(embed_dim,num_heads) for _ in range(num_blocks)]
+            [TransformerBlock(embed_dim,num_heads,dropout=0.1) for _ in range(num_blocks)]
         )
         self.final_linear = nn.Linear(embed_dim, vocab_size)
         
 
     def forward(self, x):
-        positions = torch.arange(x.shape[1])  
+        positions = torch.arange(x.shape[1]).to(x.device)  
         x = self.embedding(x) + self.pos_embedding(positions)
         for block in self.blocks:
             x = block(x)
@@ -158,6 +170,8 @@ embed_dim = 64
 num_blocks = 4
 
 model = TinyLLM(vocab_size,embed_dim,num_blocks,num_heads=8)
+model.to(device)
+model.train()
 input_ids,target_ids = batch(train_ids,size=32,batch_size=16)
 output = model(input_ids)
 print(output.shape)
@@ -170,8 +184,17 @@ if os.path.exists("model.pt"):
     print("Checkpoint Loaded")
 else:
     print("Fresh Start")
+val_input,val_target = batch(val_ids,size=32,batch_size=16)
 
-for i in range(1000):
+warmup = 1000
+total = 50000
+max_lr = 0.0005
+min_lr = 0.00005
+for i in range(50000):
+    current = getlr(i,warmup,total,max_lr,min_lr)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = current
+
     input_ids,target_ids = batch(train_ids,size=32,batch_size=16)
     output = model(input_ids)
     output = output.reshape(-1,vocab_size)
@@ -182,8 +205,8 @@ for i in range(1000):
     loss.backward()
     optimizer.step()
 
-    if i % 100 == 0:
-        val_input,val_target = batch(val_ids,size=32,batch_size=16)
+    if i % 1000 == 0:
+
         with torch.no_grad():
             val_output = model(val_input)
             val_output = val_output.reshape(-1,vocab_size)
@@ -194,24 +217,24 @@ for i in range(1000):
 torch.save(model.state_dict(),"model.pt")
 torch.save(optimizer.state_dict(),"optimizer.pt")
 
-def generate(model, tokenizer, start_word, num_words=50,block_size=32):
+def generate(model, tokenizer, prompt, num_words=50,block_size=32):
     model.eval()
-    ids = tokenizer.encode(start_word)
+    ids = tokenizer.encode(prompt)
     
     for _ in range(num_words):
         context = ids[-block_size:]
-        x = torch.tensor(context).unsqueeze(0)
+        x = torch.tensor(context).unsqueeze(0).to(device)
         
         with torch.no_grad():
             output = model(x)
         
         # get last token's prediction
         last_scores = output[0,-1]
-        next_id = top_k_sample(last_scores, k=3, temperature=0.7)
+        next_id = top_k_sample(last_scores, k=10, temperature=1.0)
         print(next_id, tokenizer.id_to_word[next_id])
         ids.append(next_id)
     
     return tokenizer.decode(ids)
-seed_text = "Hello, Who are you?"
+seed_text = "My name is Sujay"
 print(generate(model, tokenizer, seed_text,num_words=50,block_size=32))
 
