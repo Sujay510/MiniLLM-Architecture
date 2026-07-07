@@ -169,6 +169,24 @@ shakespeare.txt
 
 The first run will also create `model.pt` and `optimizer.pt` in the same folder once training finishes. These get loaded automatically on later runs to resume training, so delete them if you want to start fresh (or if you change the architecture, see Known Limitations).
 
+### Running without GPU
+
+This line in `FINAL.py` already handles machines without an Apple Silicon GPU automatically:
+
+```python
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+```
+
+`torch.backends.mps.is_available()` just checks if you're on Apple Silicon with MPS support. If not (Windows, Linux, Intel Mac), this line already falls back to `"cpu"` on its own. No changes needed, it just runs slower.
+
+If you're on an M-series Mac but want to force CPU anyway (for example, to debug whether a bug is MPS-specific), change that one line to:
+
+```python
+device = torch.device("cpu")
+```
+
+That's the only line that needs to change either way. Everything else in the code (`model.to(device)`, the masks, `batch()`, `generate()`) reads `device` from this single variable, so nothing downstream needs touching.
+
 ```bash
 pip install torch
 python FINAL.py
