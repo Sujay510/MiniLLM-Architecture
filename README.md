@@ -1,129 +1,151 @@
 # MiniLLM Architecture
-A Transformer-based language model built from scratch in PyTorch - no HuggingFace, no high-level LLM abstractions. Every component is implemented manually to understand what actually happens inside a language model.
+
+A Transformer-based language model built from scratch in PyTorch. No HuggingFace, no high-level LLM abstractions. Every component is implemented manually to understand what actually happens inside a language model.
 
 ---
 
 ## What This Is
 
-This project builds a working LLM pipeline across incremental steps, starting from raw gradient descent and ending at a model that tokenizes text, trains on next-token prediction, and autoregressively generates output.
+This project builds a working LLM pipeline across incremental steps, starting from raw gradient descent (a single weight learning `w * x = y`) and ending at a full GPT-2 style transformer that trains on Shakespeare and generates text autoregressively.
 
-**The goal was not to train a useful model - it was to verify that every component of the Transformer pipeline is correctly implemented from first principles.**
+The goal was never to build something competitive with a real model. It was to understand every piece by building it, breaking it, and fixing it.
 
 ---
 
-## Model Architecture
+## Current Architecture (FINAL.py)
 
 | Parameter | Value |
 |-----------|-------|
-| `embed_dim` | 8 |
-| `num_blocks` | 2 |
-| `num_heads` | 1 (single-head attention) |
-| `ffn_dim` | 32 (4× embed_dim, per original Transformer paper) |
-| `vocab_size` | 6 (word-level, corpus-specific) |
-| `seq_len` | 5 |
-| `optimizer` | Adam, lr=0.01 |
+| `embed_dim` | 64 |
+| `num_blocks` | 4 |
+| `num_heads` | 8 |
+| `ffn_dim` | 256 (4x embed_dim) |
+| `vocab_size` | ~745 (BPE, trained on Shakespeare corpus) |
+| `block_size` | 32 |
+| `batch_size` | 16 |
+| `dropout` | 0.1 |
+| `optimizer` | Adam, warmup + cosine decay (max_lr 5e-4, min_lr 5e-5) |
 | `loss` | Cross-entropy (next-token prediction) |
-
-Total parameters: ~500 (intentionally minimal - pipeline validation, not scale)
+| `device` | MPS (Apple Silicon) with CPU fallback |
 
 ---
 
-## Components (by file)
+## Components
 
-### `tokenizer.py` - Word-level tokenizer
-Splits text on whitespace, builds a sorted vocabulary, maps words to integer IDs and back. No OOV handling - toy use only.
+### `bytepairencoder.py` - BPE tokenizer
+Trains subword merges on the corpus and encodes/decodes text into subword tokens. This replaced the earlier word-level tokenizer, which crashed on any word it hadn't seen during training. BPE never crashes on unknown input since it can always fall back to smaller pieces.
 
-### `simplenetwork.py` - Baseline feedforward network
-A 2-layer MLP with ReLU trained via SGD to verify the gradient descent loop before adding any Transformer complexity.
+### `TinyLLM` (in FINAL.py) - the model
+Token embeddings + learned positional embeddings, stacked `TransformerBlock`s, and a final linear layer projecting to vocab size.
 
-### `selfattention.py` - Self-attention module
-Implements Q/K/V projections, scaled dot-product attention (`scores / √embed_dim`), and LayerNorm with residual connection.
-
-The scaling by `√embed_dim` prevents softmax saturation: without it, large dot products push the softmax toward a one-hot distribution, causing vanishing gradients and stalled training.
-
-### `llm.py` - Full TinyLLM
-Combines all components into a working model:
-
-**Causal mask** - prevents each token from attending to future positions. Implemented as an upper-triangular mask filled with `-inf` before softmax, so future positions contribute exactly zero attention weight (`e^-inf = 0`).
+### `MultiHeadAttention`
+Splits Q, K, V into multiple heads so different heads can specialize in different kinds of relationships between tokens (grammar, position, semantics, etc.), then concatenates and projects back with `Wo`. Uses scaled dot-product attention (`scores / sqrt(head_dim)`) with a causal mask so tokens can't attend to future positions.
 
 ```python
-mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(x.device)
 scores = scores.masked_fill(mask, float('-inf'))
 ```
 
-**Positional embeddings** - learned embeddings added to token embeddings so the model can distinguish token order. Addition (not concatenation) keeps the hidden dimension constant across all downstream layers.
+### `TransformerBlock`
+Pre-LayerNorm architecture (GPT-2 style), not the original post-LN from the "Attention is All You Need" paper:
 
 ```python
-h = self.token_emb(x) + self.pos_emb(positions)
+output = self.attention(self.norm1(x))
+x = self.dropout(output) + x
+ff_output = self.ff(self.norm2(x))
+x = self.dropout(ff_output) + x
 ```
 
-**Feed-forward network** - inner dimension is 4× the embedding dimension, following the original Transformer paper. Applied per-token after attention.
+Normalizing before the sublayer instead of after made training noticeably more stable and let the model converge faster once we switched.
 
-**Training** - next-token prediction with cross-entropy loss. Input is `ids[:-1]`, target is `ids[1:]`.
+### Dropout
+Added inside `MultiHeadAttention` (after the output projection) and inside `TransformerBlock` (before both residual connections). Dropout has no learnable parameters, so switching between architectures without it and with it is safe as long as the rest of the model didn't change.
 
-**Generation** - autoregressive: feed the current sequence, take the last token's logits, argmax to get the next token, append and repeat.
+### Training loop
+Batches are sampled randomly from the corpus rather than read sequentially, so the model can't just memorize word order. Train/val split is 90/10, and the validation batch is fixed once at the start of training rather than resampled every check, so loss readings are comparable across iterations instead of just noise.
+
+Learning rate follows linear warmup into cosine decay:
+
+```python
+def getlr(current, warmup, total, max_lr, min_lr):
+    if current < warmup:
+        return max_lr * (current / warmup)
+    progress = (current - warmup) / (total - warmup)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+```
+
+Checkpointing saves both model and optimizer state, since Adam's momentum and velocity estimates are just as important to preserve as the weights themselves. Resuming without the optimizer state means losing all that accumulated momentum and effectively restarting the optimizer from scratch.
+
+### Generation
+Uses top-k sampling with temperature instead of greedy argmax, which was getting stuck in repetition loops (`I have not not not not revenge`). `k=10, temperature=1.0` gave a decent balance between coherence and variety for this model size.
+
+```python
+def top_k_sample(logits, k, temperature=1.0):
+    ...
+    sample = torch.multinomial(probs, num_samples=1)
+    return indices[sample].item()
+```
+
+### GPU support
+Runs on Apple Silicon via MPS. Every tensor that touches the model (batches, causal masks, position indices, generation input) has to be moved to the same device as the model, or PyTorch throws a device mismatch error. The device is read from `x.device` inside modules rather than a hardcoded global, so the code isn't tied to one specific backend.
 
 ---
 
 ## Training Results
 
-```
-Corpus     : "hello i am sujay you are"
-Vocab size : 6
-embed_dim  : 8
-num_blocks : 2
-Optimizer  : Adam, lr=0.01
-```
-
-| Iteration | Loss   |
-|-----------|--------|
-| 0         | 2.0809 |
-| 100       | 0.0091 |
-| 500       | 0.0006 |
-| 1000      | 0.0002 |
-
-The model memorizes the 6-word corpus - this is expected and intentional. The loss curve confirms the pipeline is correct: a healthy descent from random initialization (loss ≈ log(6) ≈ 1.79 expected at random) down to near-zero, with no NaNs, no gradient issues, and correct autoregressive output.
+Trained on the full Shakespeare corpus, 50k+ iterations across several sessions (checkpointed and resumed each time).
 
 ```
-Generated: "hello i am sujay you are"
+Iter 0:     train_loss=6.9523, val_loss=6.9657   (fresh start after Pre-LN switch)
+Iter 40000: train_loss=0.2403, val_loss=0.2928
+Iter 49000: train_loss=0.3351, val_loss=0.3677   (after adding dropout + LR schedule)
 ```
 
-This is the correct output - the model has learned the one sequence it was trained on.
+Sample generation:
+
+```
+Prompt: "My name is Sujay"
+Output: "...ROMEO: Gither the fear the worn in the ladence,"
+```
+
+Not coherent English, but the model reliably reproduces Shakespeare-style formatting (character names in caps followed by a colon, period-appropriate contractions like "corn'd", archaic phrasing) which shows it actually learned structural patterns from the corpus rather than just memorizing.
 
 ---
 
-## Key Concepts Implemented from Scratch
+## What Changed From the Toy Version
 
-| Concept | Where |
-|---|---|
-| Gradient descent + backprop | `simplenetwork.py` |
-| Word-level tokenization | `tokenizer.py` |
-| Q/K/V attention + scaling | `selfattention.py`, `llm.py` |
-| Causal masking | `llm.py` |
-| Residual connections | `llm.py` |
-| LayerNorm | `llm.py` |
-| Positional embeddings | `llm.py` |
-| Next-token prediction training | `llm.py` |
-| Autoregressive generation | `llm.py` |
+The very first version of this model (single-head attention, word-level tokenizer, 6-word vocab, post-LN, no dropout, argmax generation) is still a good reference for understanding the basics without the added complexity. The current version adds:
+
+- BPE tokenizer instead of word-level (no more crashing on unseen words)
+- Multi-head attention instead of single-head
+- Separate `TransformerBlock` class instead of FFN merged into the attention module
+- Pre-LayerNorm instead of post-LayerNorm
+- Dropout regularization
+- Fixed validation batch instead of resampling every check
+- Batched training on a real corpus instead of one sentence
+- GPU (MPS) support
+- Learning rate warmup + cosine decay instead of a constant LR
+- Top-k + temperature sampling instead of greedy argmax
+- Checkpointing for both model and optimizer state
 
 ---
 
 ## Known Limitations
 
-- Word-level tokenizer with no OOV handling - words outside the training vocabulary will crash `encode`
-- Single-head attention only - multi-head attention is the natural next extension
-- FFN is inside the `SelfAttention` class rather than a separate `TransformerBlock` - architecturally merged for simplicity
-- Trained on a 6-word corpus - the model memorizes rather than generalizes (by design)
-- Generation uses argmax (greedy) - deterministic, no temperature or top-k sampling
+- Word-level BPE vocab is still corpus-specific (~745 tokens), nowhere near GPT-2's 50k
+- No weight decay yet (plain Adam, not AdamW)
+- No gradient clipping
+- Single machine, single GPU, no distributed training
+- The model has only ever seen Shakespeare, so it has no general world knowledge and can't answer questions, only continue Shakespeare-style text
 
 ---
 
 ## What's Next
 
-- [ ] Multi-head attention
-- [ ] Separate `TransformerBlock` class (attention + FFN + LayerNorm)
-- [ ] Top-k sampling with temperature for generation
-- [ ] Train on a real corpus (WikiText-2 or similar)
+- [ ] Weight decay (AdamW)
+- [ ] Gradient clipping
+- [ ] Retrieval-augmented generation (RAG): embed a small document set, retrieve relevant context by similarity, feed it to the model alongside the question
+- [ ] Train on structured Context/Question/Answer data so the model can actually learn to use retrieved context, not just continue Shakespeare
 
 ---
 
@@ -133,7 +155,21 @@ This is the correct output - the model has learned the one sequence it was train
 torch
 ```
 
+## Setup
+
+These three files need to be in the same folder for `FINAL.py` to run:
+
+```
+FINAL.py
+bytepairencoder.py
+shakespeare.txt
+```
+
+`FINAL.py` trains the BPE tokenizer directly on `shakespeare.txt` at the top of the script, and imports `bytepairencoder.py` for the actual encode/decode/train_bpe logic. If either file is missing or named differently, it'll fail before training even starts.
+
+The first run will also create `model.pt` and `optimizer.pt` in the same folder once training finishes. These get loaded automatically on later runs to resume training, so delete them if you want to start fresh (or if you change the architecture, see Known Limitations).
+
 ```bash
 pip install torch
-python llm.py
+python FINAL.py
 ```
